@@ -550,7 +550,9 @@ def create_combined_correction_prompt(api_id: str,
                                      nip: Optional[str] = None,
                                      shopnetwork: Optional[str] = None,
                                      raw_address: Optional[str] = None) -> str:
-    """Build a combined prompt for product correction AND city determination."""
+    """Build a universal prompt for product correction AND city determination for ALL countries."""
+
+    # Calculate current total from products
     current_total = 0.0
     lines = []
     for i, p in enumerate(products_json, 1):
@@ -561,7 +563,10 @@ def create_combined_correction_prompt(api_id: str,
         current_total += pt
         lines.append(f"{i}. {name} | Qty: {qty} × {ps} = {pt}")
 
-    currency = "PLN" if (country_code or "IT") == "PL" else "EUR"
+    # Determine currency based on country
+    currency = get_currency_for_country(country_code or "PL")
+
+    # Calculate total difference
     total_block = ""
     if total_price and total_price > 0:
         difference = abs(total_price - current_total)
@@ -573,7 +578,7 @@ def create_combined_correction_prompt(api_id: str,
 
     total_receipt_str = f"{total_price:.2f}" if total_price and total_price > 0 else "null"
 
-    # Собираем уникальные продукты для анализа города
+    # Sample products for city analysis
     unique_products = []
     seen = set()
     for p in products_json[:15]:
@@ -583,109 +588,62 @@ def create_combined_correction_prompt(api_id: str,
             seen.add(name)
     products_text = "\n".join(f"- {p}" for p in unique_products[:10])
 
-    # Извлекаем адреса, ZIP код и провинцию для промпта
-    shop_address, headquarters_address = extract_addresses_from_receipt(raw_address) if raw_address else (None, None)
-    
-    # Извлекаем zip_code из адреса магазина (приоритет) или из общего адреса
-    zip_code = None
-    if shop_address:
-        zip_code = extract_zip_code(shop_address, country_code or "PL")
-    if not zip_code and raw_address:
-        zip_code = extract_zip_code(raw_address, country_code or "PL")
-    
-    # Извлекаем код провинции для Италии
-    province_code = None
-    if country_code == "IT":
-        if shop_address:
-            province_code = extract_province_code(shop_address, country_code)
-        if not province_code and raw_address:
-            province_code = extract_province_code(raw_address, country_code)
-        logger.info(f"Extracted for IT in batch: ZIP={zip_code}, Province={province_code} from address={raw_address}")
+    # UNIVERSAL PROMPT FOR ALL COUNTRIES - AI will adapt based on provided hints
+    prompt = f"""
+You are an AI expert in European retail and receipt data analysis.
 
-    # Разные промпты для разных стран
-    if country_code == "PL":
-        prompt = f"""
-You are an expert in Polish retail geography and receipt data correction.
-
-CRITICAL TASK: Fix product names AND prices, AND determine the city from receipt data.
-
-RECEIPT DATA:
+**CONTEXT:**
+- Country: {country_code or 'Unknown'}
 - API_ID: {api_id}
-- NIP (VAT Number): {nip or 'none'}
+- Currency: {currency}
+
+**HINTS PROVIDED (use these to help identify the city):**
+- NIP/VAT Number: {nip or 'none'}
 - Store Network: {shopnetwork or 'none'}
-- Raw Address: {raw_address or 'none'}
-- Sample products from receipt:
+- Raw Address from Receipt: {raw_address or 'none'}
+
+**SAMPLE PRODUCTS FROM RECEIPT:**
 {products_text}
 
-RECEIPT ITEMS:
+**RECEIPT ITEMS TO ANALYZE:**
 {chr(10).join(lines)}{total_block}
 
-YOUR TASKS:
-1. FIX PRODUCT NAMES (IMPORTANT - KEEP POLISH LANGUAGE):
-   - Expand abbreviations: 'SOK JABŁKOWY' → 'Sok Jabłkowy'
-   - Fix typos: 'OGORKI' → 'Ogórki', 'BULKI' → 'Bułki'
+**YOUR TASKS:**
+
+1. **FIX PRODUCT NAMES:**
+   - Keep products in their NATIVE language (Polish→Polish, Italian→Italian, German→German, etc.)
+   - Expand abbreviations and fix OCR errors
    - Standardize units: '1L' → '1 L', '500G' → '500 g'
-   - Fix OCR errors: 'M0KA' → 'Mąka', 'SZYNKA' → 'Szynka'
-   - Keep Polish names: 'Mąka Basia' stays 'Mąka Basia' (NOT 'Basia Flour')
-   - Keep Polish names: 'Szynka' stays 'Szynka' (NOT 'Ham')
-   - Use proper Polish capitalization: 'SOK JABŁKOWY' → 'Sok Jabłkowy'
-   - Fix Polish diacritics: 'ą', 'ć', 'ę', 'ł', 'ń', 'ó', 'ś', 'ź', 'ż'
-   - Common Polish products: Chleb, Mleko, Masło, Ser, Wędlina, Owoce, Warzywa
+   - Use proper capitalization for the country's language
+   - Fix diacritics specific to the language
+   - Examples:
+     * Polish: 'SOK JABŁKOWY' → 'Sok Jabłkowy' (NOT'Apple Juice')
+     * Italian: 'FORMAGGIO' → 'Formaggio' (NOT 'Cheese')
+     * German: 'BROT' → 'Brot' (NOT 'Bread')
 
-2. FIX PRICES (CRITICAL):
-   - OCR often misreads prices (e.g., 1.89 might be 1.39, 3.09 might be 8.09)
-   - Check if quantity × unit price = total price for each item
-   - If not, adjust the unit price or quantity to make it consistent
-   - All corrected prices must sum up to the receipt total (if provided)
-   - Common OCR errors: 3→8, 5→6, 1→7, 0→8, 9→4
+2. **FIX PRICES (CRITICAL):**
+   - OCR often misreads digits: 3→8, 5→6, 1→7, 0→8, 9→4
+   - Verify: quantity × price_single = price_total for EACH item
+   - Adjust prices if arithmetic doesn't match
+   - Sum of ALL price_total MUST equal receipt total (if provided)
 
-3. DETERMINE CITY (CRITICAL - USE POLISH NAMES):
-   - ALWAYS use Polish city names: Warszawa (not Warsaw), Kraków (not Cracow), Łódź (not Lodz)
-   - PRIORITY #1: Use ZIP code if available ({zip_code or 'none'}) ⭐
-   - PRIORITY #2: Use NIP first digits for regional hints:
-     * 10-19: Mazowieckie (Warszawa area)
-     * 20-29: Małopolskie (Kraków area)
-     * 30-39: Lubelskie, Podkarpackie
-     * 40-49: Śląskie (Katowice area)
-     * 50-59: Dolnośląskie (Wrocław area)
-     * 60-69: Wielkopolskie (Poznań area)
-     * 70-79: Zachodniopomorskie (Szczecin area)
-     * 80-89: Pomorskie (Gdańsk area)
-     * 90-99: Warmińsko-mazurskie, Podlaskie
-   - Use retail chain geographic presence knowledge
-   - Analyze product types for regional preferences
-   - Provide population estimates based on city size knowledge
-   - Major Polish cities: Warszawa (~1.8M), Kraków (~780K), Łódź (~680K), Wrocław (~640K), Poznań (~540K), Gdańsk (~470K)
+3. **EXTRACT CITY FROM RECEIPT DATA:**
+   - **PRIORITY #1:** Look for ZIP/Postal code in the address and try to match it to a city
+   - **PRIORITY #2:** Extract city name directly from the address text
+   - **PRIORITY #3:** Use NIP/VAT first digits for regional hints (if applicable)
+   - **PRIORITY #4:** Use Store Network geographic presence to narrow down location
+   - **ALWAYS use national city names:** Warszawa (not Warsaw), Roma (not Rome), München (not Munich)
+   - If you cannot determine the city with confidence, return "UNKNOWN"
 
-POLISH RETAIL CHAINS KNOWLEDGE:
-- BIEDRONKA: Strong in all major cities, especially Warszawa, Kraków, Wrocław
-- ŻABKA: Especially strong in Warszawa, Kraków, Wrocław, Poznań
-- KAUFLAND: Major cities, especially Wrocław, Poznań, Warszawa
-- LIDL: All major cities, strong presence everywhere
-- CARREFOUR: Warszawa, Kraków, Poznań, Wrocław
-- TESCO: Major cities, especially Warszawa, Kraków
-- ALDI: Growing presence in major cities
-- NETTO: Strong in northern regions
+**MATCHING STRATEGY FOR CITY:**
+- Try to extract ZIP code from address first
+- If ZIP code found, match it against known cities in {country_code}
+- If no ZIP code, try to parse city name from address string
+- Consider NIP/VAT regional patterns if available
+- Use retail chain presence knowledge
+- Return confidence: HIGH (ZIP match), MEDIUM (address/NIP match), LOW (guess)
 
-POLISH REGIONS AND MAJOR CITIES (USE STANDARD FORMS):
-- MAZOWIECKIE: Warszawa, Radom, Płock, Siedlce, Ostrołęka
-- MAŁOPOLSKIE: Kraków, Tarnów, Nowy Sącz, Oświęcim
-- ŚLĄSKIE: Katowice, Częstochowa, Sosnowiec, Gliwice, Zabrze, Bytom
-- WIELKOPOLSKIE: Poznań, Kalisz, Konin, Piła
-- DOLNOŚLĄSKIE: Wrocław, Wałbrzych, Legnica, Jelenia Góra
-- ŁÓDZKIE: Łódź, Piotrków Trybunalski, Pabianice, Tomaszów Mazowiecki
-- POMORSKIE: Gdańsk, Gdynia, Sopot, Słupsk, Tczew
-- ZACHODNIOPOMORSKIE: Szczecin, Koszalin, Stargard, Kołobrzeg
-- LUBELSKIE: Lublin, Chełm, Zamość, Biała Podlaska
-- PODKARPACKIE: Rzeszów, Przemyśl, Stalowa Wola, Mielec
-- PODLASKIE: Białystok, Suwałki, Łomża, Augustów
-- WARMIŃSKO-MAZURSKIE: Olsztyn, Elbląg, Ełk, Ostróda
-- KUJAWSKO-POMORSKIE: Bydgoszcz, Toruń, Włocławek, Grudziądz
-- ŚWIĘTOKRZYSKIE: Kielce, Ostrowiec Świętokrzyski, Starachowice
-- LUBUSKIE: Zielona Góra, Gorzów Wielkopolski, Żary, Nowa Sól
-- OPOLSKIE: Opole, Kędzierzyn-Koźle, Nysa, Brzeg
-
-OUTPUT FORMAT (strict JSON):
+**OUTPUT FORMAT (strict JSON):**
 {{
   "api_id": "{api_id}",
   "total_receipt": {total_receipt_str},
@@ -693,589 +651,31 @@ OUTPUT FORMAT (strict JSON):
   "corrections_made": true/false,
   "products": [
     {{
-      "name_original": "original name from receipt",
-      "name_corrected": "fixed name",
+      "name_original": "original name",
+      "name_corrected": "corrected name in NATIVE language",
       "quantity": integer,
       "price_single_original": number,
       "price_single_corrected": number,
       "price_total": number,
-      "price_correction_reason": "OCR error: 3→8" or null
-    }}
-  ],
-  "city_analysis": {{
-    "city": "city name or UNKNOWN (use standard forms: Warszawa, Kraków, Gdańsk)",
-    "region": "region name or UNKNOWN",
-    "zip_code": "extracted or matched zip code or null",
-    "city_population": integer,
-    "match_method": "zip_code_match" | "address_match" | "name_match" | "nip_hint",
-    "confidence": "HIGH/MEDIUM/LOW",
-    "evidence": "brief explanation of how you identified the location, including which matching method was used"
-  }}
-}}
-
-IMPORTANT: Ensure all arithmetic is correct, total matches, product names stay in Polish, and provide best city estimate!
-
-CRITICAL: Return ONLY valid JSON, no markdown formatting, no code blocks, no explanations. Just pure JSON.
-"""
-    elif country_code == "IT":
-        prompt = f"""
-You are an expert in Italian retail geography and receipt data correction.
-
-CRITICAL TASK: Fix product names AND prices, AND determine the city from receipt data.
-
-CRITICAL MATCHING PRIORITY for city determination (use in this exact order):
-1. ZIP CODE MATCH (HIGHEST PRIORITY) ⭐⭐⭐
-   - If zip_code is provided and not 'none', use it FIRST
-   - Example: zip_code "80126" → NAPOLI (Campania)
-   - Example: zip_code "00100" → ROMA (Lazio)
-   
-2. PROVINCE/REGION CODE MATCH ⭐⭐
-   - If address contains (RM), (NA), (MI), etc. → filter by province
-   - Example: "(RM)" → Roma province → filter cities in Lazio
-   
-3. STREET ADDRESS CONTEXT ⭐
-   - Use street name to disambiguate between similar cities
-   
-4. NORMALIZED CITY NAME SIMILARITY
-   - Use only if ZIP/province not available
-   
-5. NIP REGION HINTS
-   - Use only as last resort
-
-RECEIPT DATA:
-- API_ID: {api_id}
-- NIP (VAT Number): {nip or 'none'}
-- Store Network: {shopnetwork or 'none'}
-- Raw Address: {raw_address or 'none'}
-- Shop Address (if separated): {shop_address or 'none'}
-- Headquarters Address (if separated): {headquarters_address or 'none'}
-- Extracted ZIP Code: {zip_code or 'none'} {'⭐ USE THIS FIRST!' if zip_code and zip_code != 'none' else ''}
-- Extracted Province Code: {province_code or 'none'} {'⭐ USE THIS SECOND!' if province_code and province_code != 'none' else ''}
-- Sample products from receipt:
-{products_text}
-
-RECEIPT ITEMS:
-{chr(10).join(lines)}{total_block}
-
-YOUR TASKS:
-1. FIX PRODUCT NAMES:
-   - Expand abbreviations: "COCA" → "COCA COLA"
-   - Fix typos: "PIANATA" → "PIADINA"
-   - Standardize units: "1,5LT" → "1.5L"
-   - Fix OCR errors: "C0CA C0LA" → "COCA COLA"
-
-2. FIX PRICES (CRITICAL):
-   - OCR often misreads prices (e.g., 1.89 might be 1.39, 3.09 might be 8.09)
-   - Check if quantity × unit price = total price for each item
-   - If not, adjust the unit price or quantity to make it consistent
-   - All corrected prices must sum up to the receipt total (if provided)
-   - Common OCR errors: 3→8, 5→6, 1→7, 0→8, 9→4
-
-3. DETERMINE CITY (IMPORTANT):
-   - PRIORITY #1: Use ZIP code if available ({zip_code or 'none'}) ⭐
-   - PRIORITY #2: Use Province code if available ({province_code or 'none'}) ⭐
-   - PRIORITY #3: Use NIP first digits for regional hints (Northern Italy: 01-19, Central: 20-59, Southern: 60-99)
-   - Consider all Italian cities and towns (population 10,000+)
-   - Use retail chain geographic presence knowledge
-   - Analyze product types for regional preferences
-   - Provide population estimates based on city size knowledge
-
-ITALIAN RETAIL CHAINS KNOWLEDGE:
-- CONAD: Cooperative stores, strong in Emilia-Romagna, Tuscany
-- CARREFOUR: Major cities, especially Milano, Roma, Napoli
-- ESSELUNGA: Lombardia, Tuscany, strong in Milano, Firenze
-- COOP: Pan-Italian, especially strong in northern regions
-- LIDL: All major cities, strong presence everywhere
-- EUROSPIN: Very cheap, strong in southern regions
-- PAM: Northern Italy, especially Lombardia
-- DESPAR: Veneto, Lombardia regions
-- PENNY MARKET: Growing presence, especially in central Italy
-- MD DISCOUNT: Southern Italy, especially Campania, Puglia
-- SELEX: Central Italy
-- FAMILA: Veneto, Friuli-Venezia Giulia
-- BENNET: Northern Italy, especially Lombardia
-- CRAI: Southern Italy, especially Sicily, Calabria
-
-ITALIAN REGIONS AND MAJOR CITIES (USE STANDARD FORMS):
-- LAZIO: Roma, Latina, Frosinone, Viterbo, Rieti
-- LOMBARDIA: Milano, Bergamo, Brescia, Monza, Como, Varese, Pavia, Cremona
-- CAMPANIA: Napoli, Salerno, Caserta, Avellino, Benevento
-- PIEMONTE: Torino, Alessandria, Novara, Cuneo, Asti
-- SICILIA: Palermo, Catania, Messina, Siracusa, Agrigento
-- VENETO: Venezia, Verona, Padova, Vicenza, Treviso
-- EMILIA-ROMAGNA: Bologna, Modena, Parma, Reggio Emilia, Ravenna, Ferrara
-- TOSCANA: Firenze, Pisa, Livorno, Prato, Siena, Arezzo
-- PUGLIA: Bari, Taranto, Foggia, Lecce, Brindisi
-- LIGURIA: Genova, La Spezia, Savona, Imperia
-- CALABRIA: Reggio Calabria, Catanzaro, Cosenza
-- MARCHE: Ancona, Pesaro, Macerata, Ascoli Piceno
-- ABRUZZO: L'Aquila, Pescara, Chieti, Teramo
-- UMBRIA: Perugia, Terni
-
-OUTPUT FORMAT (strict JSON):
-{{
-  "api_id": "{api_id}",
-  "total_receipt": {total_receipt_str},
-  "total_calculated": <sum of all corrected price_total>,
-  "corrections_made": true/false,
-  "products": [
-    {{
-      "name_original": "original name from receipt",
-      "name_corrected": "fixed name",
-      "quantity": integer,
-      "price_single_original": number,
-      "price_single_corrected": number,
-      "price_total": number,
-      "price_correction_reason": "OCR error: 3→8" or null
-    }}
-  ],
-  "city_analysis": {{
-    "city": "city name or UNKNOWN (use standard forms: Roma, Milano, Napoli)",
-    "region": "region name or UNKNOWN",
-    "zip_code": "extracted or matched zip code or null",
-    "province_code": "extracted province code (RM, NA, MI, etc.) or null",
-    "city_population": integer,
-    "match_method": "zip_code_match" | "province_match" | "address_match" | "name_match" | "nip_hint",
-    "confidence": "HIGH/MEDIUM/LOW",
-    "evidence": "brief explanation of how you identified the location, including which matching method was used"
-  }}
-}}
-
-IMPORTANT: Ensure all arithmetic is correct, total matches, and provide best city estimate!
-
-CRITICAL: Return ONLY valid JSON, no markdown formatting, no code blocks, no explanations. Just pure JSON.
-"""
-    elif country_code == "DE":
-        prompt = f"""
-You are an expert in German retail geography and receipt data correction.
-
-CRITICAL TASK: Fix product names AND prices, AND determine the city from receipt data.
-
-RECEIPT DATA:
-- API_ID: {api_id}
-- NIP (VAT Number): {nip or 'none'}
-- Store Network: {shopnetwork or 'none'}
-- Raw Address: {raw_address or 'none'}
-- Sample products from receipt:
-{products_text}
-
-RECEIPT ITEMS:
-{chr(10).join(lines)}{total_block}
-
-YOUR TASKS:
-1. FIX PRODUCT NAMES (IMPORTANT - KEEP GERMAN LANGUAGE):
-   - Expand abbreviations: 'BROT' → 'Brot', 'MILCH' → 'Milch'
-   - Fix typos: 'WURST' → 'Wurst', 'KASE' → 'Käse'
-   - Standardize units: '1L' → '1 L', '500G' → '500 g'
-   - Fix OCR errors: 'BROT' → 'Brot', 'BUTTER' → 'Butter'
-   - Keep German names: 'Brot' stays 'Brot' (NOT 'Bread')
-   - Keep German names: 'Wurst' stays 'Wurst' (NOT 'Sausage')
-   - Use proper German capitalization: 'BROT' → 'Brot'
-   - Fix German diacritics: 'ä', 'ö', 'ü', 'ß'
-   - Common German products: Brot, Milch, Butter, Käse, Wurst, Obst, Gemüse
-
-2. FIX PRICES (CRITICAL):
-   - OCR often misreads prices (e.g., 1.89 might be 1.39, 3.09 might be 8.09)
-   - Check if quantity × unit price = total price for each item
-   - If not, adjust the unit price or quantity to make it consistent
-   - All corrected prices must sum up to the receipt total (if provided)
-   - Common OCR errors: 3→8, 5→6, 1→7, 0→8, 9→4
-
-3. DETERMINE CITY (IMPORTANT):
-   - Use retail chain geographic presence knowledge
-   - Consider all German cities and towns (population 50,000+)
-   - Analyze product types for regional preferences
-   - Provide population estimates based on city size knowledge
-
-GERMAN RETAIL CHAINS KNOWLEDGE:
-- ALDI: Strong nationwide, especially in rural areas
-- LIDL: Pan-German presence, strong in all regions
-- REWE: Strong in western and southern Germany
-- EDEKA: Strong regional presence, especially in northern Germany
-- KAUFLAND: Major cities, especially in eastern Germany
-- REAL: Large cities, especially in urban centers
-- NETTO: Strong in northern and eastern Germany
-- PENNY: Growing presence, especially in urban areas
-- NORMA: Southern Germany, especially Bavaria
-- TEGUT: Hesse, Thuringia regions
-- SPAR: Various regions, especially rural areas
-
-GERMAN MAJOR CITIES (USE STANDARD FORMS):
-- NORTH RHINE-WESTPHALIA: Köln, Düsseldorf, Dortmund, Essen, Duisburg, Bochum, Wuppertal, Bielefeld, Bonn, Münster
-- BAVARIA: München, Nürnberg, Augsburg, Regensburg, Ingolstadt, Würzburg, Fürth, Erlangen, Bayreuth
-- BADEN-WÜRTTEMBERG: Stuttgart, Mannheim, Karlsruhe, Freiburg, Heidelberg, Heilbronn, Ulm, Pforzheim, Reutlingen
-- LOWER SAXONY: Hannover, Braunschweig, Osnabrück, Oldenburg, Göttingen, Wolfsburg, Hildesheim, Salzgitter
-- HESSE: Frankfurt, Wiesbaden, Kassel, Darmstadt, Offenbach, Hanau, Marburg, Gießen
-- SAXONY: Dresden, Leipzig, Chemnitz, Zwickau, Plauen, Görlitz, Freiberg, Bautzen
-- RHINELAND-PALATINATE: Mainz, Ludwigshafen, Koblenz, Trier, Kaiserslautern, Worms, Neuwied
-- BERLIN: Berlin (city-state)
-- HAMBURG: Hamburg (city-state)
-- BREMEN: Bremen, Bremerhaven (city-state)
-- SCHLESWIG-HOLSTEIN: Kiel, Lübeck, Flensburg, Neumünster, Norderstedt
-- MECKLENBURG-WESTERN POMERANIA: Schwerin, Rostock, Neubrandenburg, Stralsund, Greifswald
-- BRANDENBURG: Potsdam, Cottbus, Brandenburg, Frankfurt (Oder), Oranienburg
-- SAXONY-ANHALT: Magdeburg, Halle, Dessau-Roßlau, Wittenberg, Stendal
-- THURINGIA: Erfurt, Jena, Gera, Weimar, Gotha, Eisenach, Nordhausen
-
-OUTPUT FORMAT (strict JSON):
-{{
-  "api_id": "{api_id}",
-  "total_receipt": {total_receipt_str},
-  "total_calculated": <sum of all corrected price_total>,
-  "corrections_made": true/false,
-  "products": [
-    {{
-      "name_original": "original name from receipt",
-      "name_corrected": "fixed name",
-      "quantity": integer,
-      "price_single_original": number,
-      "price_single_corrected": number,
-      "price_total": number,
-      "price_correction_reason": "OCR error: 3→8" or null
-    }}
-  ],
-  "city_analysis": {{
-    "city": "city name or UNKNOWN (use standard forms: Berlin, München, Hamburg)",
-    "region": "region/province name or UNKNOWN",
-    "city_population": integer,
-    "confidence": "HIGH/MEDIUM/LOW",
-    "evidence": "brief explanation of how you identified the location"
-  }}
-}}
-
-IMPORTANT: Ensure all arithmetic is correct, total matches, product names stay in German, and provide best city estimate!
-
-CRITICAL: Return ONLY valid JSON, no markdown formatting, no code blocks, no explanations. Just pure JSON.
-"""
-    elif country_code == "FR":
-        prompt = f"""
-You are an expert in French retail geography and receipt data correction.
-
-CRITICAL TASK: Fix product names AND prices, AND determine the city from receipt data.
-
-RECEIPT DATA:
-- API_ID: {api_id}
-- NIP (VAT Number): {nip or 'none'}
-- Store Network: {shopnetwork or 'none'}
-- Raw Address: {raw_address or 'none'}
-- Sample products from receipt:
-{products_text}
-
-RECEIPT ITEMS:
-{chr(10).join(lines)}{total_block}
-
-YOUR TASKS:
-1. FIX PRODUCT NAMES (IMPORTANT - KEEP FRENCH LANGUAGE):
-   - Expand abbreviations: 'PAIN' → 'Pain', 'LAIT' → 'Lait'
-   - Fix typos: 'FROMAGE' → 'Fromage', 'JAMBON' → 'Jambon'
-   - Standardize units: '1L' → '1 L', '500G' → '500 g'
-   - Fix OCR errors: 'PAIN' → 'Pain', 'BEURRE' → 'Beurre'
-   - Keep French names: 'Pain' stays 'Pain' (NOT 'Bread')
-   - Keep French names: 'Jambon' stays 'Jambon' (NOT 'Ham')
-   - Use proper French capitalization: 'PAIN' → 'Pain'
-   - Fix French diacritics: 'à', 'â', 'ä', 'ç', 'é', 'è', 'ê', 'ë', 'î', 'ï', 'ô', 'ö', 'ù', 'û', 'ü', 'ÿ'
-   - Common French products: Pain, Lait, Beurre, Fromage, Jambon, Fruits, Légumes
-
-2. FIX PRICES (CRITICAL):
-   - OCR often misreads prices (e.g., 1.89 might be 1.39, 3.09 might be 8.09)
-   - Check if quantity × unit price = total price for each item
-   - If not, adjust the unit price or quantity to make it consistent
-   - All corrected prices must sum up to the receipt total (if provided)
-   - Common OCR errors: 3→8, 5→6, 1→7, 0→8, 9→4
-
-3. DETERMINE CITY (IMPORTANT):
-   - Use retail chain geographic presence knowledge
-   - Consider all French cities and towns (population 50,000+)
-   - Analyze product types for regional preferences
-   - Provide population estimates based on city size knowledge
-
-FRENCH RETAIL CHAINS KNOWLEDGE:
-- CARREFOUR: Pan-French presence, strong in major cities
-- LECLERC: Strong nationwide, especially in rural and suburban areas
-- AUCHAN: Major cities, especially in northern and eastern France
-- CASINO: Southern France, especially in Provence and Languedoc
-- INTERMARCHE: Strong in rural areas and small towns
-- SUPER U / SYSTEME U: Cooperative stores, strong in western France
-- LIDL: Growing presence, especially in urban areas
-- ALDI: Growing presence, especially in eastern France
-- MONOPRIX: Urban centers, especially Paris and major cities
-- FRANPRIX: Paris and urban centers
-- SPAR: Various regions, especially rural areas
-
-FRENCH MAJOR CITIES (USE STANDARD FORMS):
-- ILE-DE-FRANCE: Paris, Boulogne-Billancourt, Saint-Denis, Argenteuil, Montreuil, Créteil, Nanterre, Vitry-sur-Seine, Courbevoie, Versailles
-- PROVENCE-ALPES-COTE D'AZUR: Marseille, Nice, Toulon, Nîmes, Aix-en-Provence, Montpellier, Avignon, Cannes, Antibes, La Seyne-sur-Mer
-- AUVERGNE-RHONE-ALPES: Lyon, Saint-Étienne, Grenoble, Villeurbanne, Clermont-Ferrand, Annecy, Valence, Chambéry, Bourg-en-Bresse, Saint-Priest
-- HAUTS-DE-FRANCE: Lille, Amiens, Roubaix, Tourcoing, Dunkerque, Calais, Villeneuve-d'Ascq, Saint-Quentin, Beauvais, Abbeville
-- GRAND EST: Strasbourg, Mulhouse, Reims, Metz, Colmar, Troyes, Charleville-Mézières, Châlons-en-Champagne, Épinal, Haguenau
-- OCCITANIE: Toulouse, Montpellier, Nîmes, Perpignan, Béziers, Montauban, Narbonne, Albi, Carcassonne, Sète
-- NOUVELLE-AQUITAINE: Bordeaux, Limoges, Poitiers, La Rochelle, Angoulême, Agen, Périgueux, Bayonne, Pau, Mont-de-Marsan
-- PAYS DE LA LOIRE: Nantes, Le Mans, Angers, Saint-Nazaire, Cholet, La Roche-sur-Yon, Laval, Saumur, Saint-Herblain, Orvault
-- BRETAGNE: Rennes, Brest, Quimper, Lorient, Vannes, Saint-Malo, Fougères, Saint-Brieuc, Lannion, Concarneau
-- NORMANDIE: Rouen, Le Havre, Caen, Cherbourg, Évreux, Dieppe, Saint-Étienne-du-Rouvray, Sotteville-lès-Rouen, Le Grand-Quevilly, Vernon
-- CENTRE-VAL DE LOIRE: Tours, Orléans, Blois, Châteauroux, Bourges, Chartres, Dreux, Vierzon, Olivet, Saint-Jean-de-Braye
-- BOURGOGNE-FRANCHE-COMTE: Dijon, Besançon, Belfort, Chalon-sur-Saône, Auxerre, Nevers, Mâcon, Sens, Montbéliard, Beaune
-- CORSE: Ajaccio, Bastia, Porto-Vecchio, Corte, Sartène, Calvi, L'Île-Rousse, Propriano, Bonifacio, Aléria
-
-OUTPUT FORMAT (strict JSON):
-{{
-  "api_id": "{api_id}",
-  "total_receipt": {total_receipt_str},
-  "total_calculated": <sum of all corrected price_total>,
-  "corrections_made": true/false,
-  "products": [
-    {{
-      "name_original": "original name from receipt",
-      "name_corrected": "fixed name",
-      "quantity": integer,
-      "price_single_original": number,
-      "price_single_corrected": number,
-      "price_total": number,
-      "price_correction_reason": "OCR error: 3→8" or null
-    }}
-  ],
-  "city_analysis": {{
-    "city": "city name or UNKNOWN (use standard forms: Paris, Lyon, Marseille)",
-    "region": "region name or UNKNOWN",
-    "city_population": integer,
-    "confidence": "HIGH/MEDIUM/LOW",
-    "evidence": "brief explanation of how you identified the location"
-  }}
-}}
-
-IMPORTANT: Ensure all arithmetic is correct, total matches, product names stay in French, and provide best city estimate!
-
-CRITICAL: Return ONLY valid JSON, no markdown formatting, no code blocks, no explanations. Just pure JSON.
-"""
-    elif country_code == "GB":
-        # Use universal prompt for GB
-        pass
-    elif country_code == "HU":
-        # Use universal prompt for HU
-        pass
-    elif country_code == "PT":
-        # Use universal prompt for PT
-        pass
-    elif country_code == "RO":
-        # Use universal prompt for RO
-        pass
-    # Old prompts removed - using universal prompt for all countries
-    if False:
-        prompt = (
-            "You are an expert in fixing Hungarian receipt data with OCR errors.\n\n"
-            "CRITICAL TASK: Fix product names AND correct prices that have OCR errors.\n"
-            "The receipt total is usually correct, but individual prices often have OCR mistakes.\n\n"
-            "RECEIPT DATA:\n"
-            f"API_ID: {api_id}\n"
-            + "\n".join(lines)
-            + total_block
-            + "\n\nYOUR TASKS:\n"
-              "1. FIX PRODUCT NAMES (IMPORTANT - KEEP HUNGARIAN LANGUAGE):\n"
-              "   - Expand abbreviations: 'KENYÉR' → 'Kenyér', 'TEJ' → 'Tej'\n"
-              "   - Fix typos: 'VAGON' → 'Vajon', 'SAJT' → 'Sajt'\n"
-              "   - Standardize units: '1L' → '1 L', '500G' → '500 g'\n"
-              "   - Fix OCR errors: 'KENYÉR' → 'Kenyér', 'VAGON' → 'Vajon'\n"
-              "   - Keep Hungarian names: 'Kenyér' stays 'Kenyér' (NOT 'Bread')\n"
-              "   - Use proper Hungarian capitalization: 'KENYÉR' → 'Kenyér'\n"
-              "   - Fix Hungarian diacritics: 'á', 'é', 'í', 'ó', 'ö', 'ő', 'ú', 'ü', 'ű'\n"
-              "   - Common Hungarian products: Kenyér, Tej, Vaj, Sajt, Sonka, Gyümölcs, Zöldség\n\n"
-              "2. FIX PRICES (CRITICAL):\n"
-              "   - OCR often misreads prices (e.g., 1.89 might be 1.39, 3.09 might be 8.09)\n"
-              "   - Check if quantity × unit price = total price for each item\n"
-              "   - If not, adjust the unit price or quantity to make it consistent\n"
-              "   - All corrected prices must sum up to the receipt total (if provided)\n"
-              "   - Common OCR errors: 3→8, 5→6, 1→7, 0→8, 9→4\n\n"
-              "3. VALIDATION RULES:\n"
-              "   - Each line: quantity × price_single MUST equal price_total\n"
-              "   - Sum of all price_total MUST equal receipt total (if provided)\n"
-              "   - Prices must be realistic for Hungarian supermarkets (100 - 50000 HUF per item)\n"
-              "   - KEEP PRODUCT NAMES IN HUNGARIAN - DO NOT TRANSLATE TO ENGLISH\n\n"
-              "HUNGARIAN PRODUCT EXAMPLES:\n"
-              "   - 'Kenyér 500g' → 'Kenyér 500 g' (NOT 'Bread 500 g')\n"
-              "   - 'Sonka 200g' → 'Sonka 200 g' (NOT 'Ham 200 g')\n"
-              "   - 'Tej 1L' → 'Tej 1 L'\n"
-              "   - 'Sajt 300g' → 'Sajt 300 g'\n\n"
-              "OUTPUT FORMAT (strict JSON):\n"
-            + "JSON schema not needed - using universal prompt"
-            + "\n\nIMPORTANT: Ensure all arithmetic is correct, total matches, and product names stay in Hungarian!"
-        )
-    elif country_code == "PT":
-        # Portuguese prompt
-        prompt = (
-            "You are an expert in fixing Portuguese receipt data with OCR errors.\n\n"
-            "CRITICAL TASK: Fix product names AND correct prices that have OCR errors.\n"
-            "The receipt total is usually correct, but individual prices often have OCR mistakes.\n\n"
-            "RECEIPT DATA:\n"
-            f"API_ID: {api_id}\n"
-            + "\n".join(lines)
-            + total_block
-            + "\n\nYOUR TASKS:\n"
-              "1. FIX PRODUCT NAMES (IMPORTANT - KEEP PORTUGUESE LANGUAGE):\n"
-              "   - Expand abbreviations: 'PÃO' → 'Pão', 'LEITE' → 'Leite'\n"
-              "   - Fix typos: 'MANTEIGA' → 'Manteiga', 'QUEIJO' → 'Queijo'\n"
-              "   - Standardize units: '1L' → '1 L', '500G' → '500 g'\n"
-              "   - Fix OCR errors: 'PÃO' → 'Pão', 'MANTEIGA' → 'Manteiga'\n"
-              "   - Keep Portuguese names: 'Pão' stays 'Pão' (NOT 'Bread')\n"
-              "   - Use proper Portuguese capitalization: 'PÃO' → 'Pão'\n"
-              "   - Fix Portuguese diacritics: 'á', 'à', 'â', 'ã', 'é', 'ê', 'í', 'ó', 'ô', 'õ', 'ú', 'ç'\n"
-              "   - Common Portuguese products: Pão, Leite, Manteiga, Queijo, Fiambre, Fruta, Legumes\n\n"
-              "2. FIX PRICES (CRITICAL):\n"
-              "   - OCR often misreads prices (e.g., 1.89 might be 1.39, 3.09 might be 8.09)\n"
-              "   - Check if quantity × unit price = total price for each item\n"
-              "   - If not, adjust the unit price or quantity to make it consistent\n"
-              "   - All corrected prices must sum up to the receipt total (if provided)\n"
-              "   - Common OCR errors: 3→8, 5→6, 1→7, 0→8, 9→4\n\n"
-              "3. VALIDATION RULES:\n"
-              "   - Each line: quantity × price_single MUST equal price_total\n"
-              "   - Sum of all price_total MUST equal receipt total (if provided)\n"
-              "   - Prices must be realistic for Portuguese supermarkets (€0.10 - €50 per item)\n"
-              "   - KEEP PRODUCT NAMES IN PORTUGUESE - DO NOT TRANSLATE TO ENGLISH\n\n"
-              "PORTUGUESE PRODUCT EXAMPLES:\n"
-              "   - 'Pão 500g' → 'Pão 500 g' (NOT 'Bread 500 g')\n"
-              "   - 'Fiambre 200g' → 'Fiambre 200 g' (NOT 'Ham 200 g')\n"
-              "   - 'Leite 1L' → 'Leite 1 L'\n"
-              "   - 'Queijo 300g' → 'Queijo 300 g'\n\n"
-              "OUTPUT FORMAT (strict JSON):\n"
-            + "JSON schema not needed - using universal prompt"
-            + "\n\nIMPORTANT: Ensure all arithmetic is correct, total matches, and product names stay in Portuguese!"
-        )
-    elif country_code == "RO":
-        # Romanian prompt
-        prompt = (
-            "You are an expert in fixing Romanian receipt data with OCR errors.\n\n"
-            "CRITICAL TASK: Fix product names AND correct prices that have OCR errors.\n"
-            "The receipt total is usually correct, but individual prices often have OCR mistakes.\n\n"
-            "RECEIPT DATA:\n"
-            f"API_ID: {api_id}\n"
-            + "\n".join(lines)
-            + total_block
-            + "\n\nYOUR TASKS:\n"
-              "1. FIX PRODUCT NAMES (IMPORTANT - KEEP ROMANIAN LANGUAGE):\n"
-              "   - Expand abbreviations: 'PÂINE' → 'Pâine', 'LAPT' → 'Lapte'\n"
-              "   - Fix typos: 'UNTE' → 'Unt', 'BRÂNZĂ' → 'Brânză'\n"
-              "   - Standardize units: '1L' → '1 L', '500G' → '500 g'\n"
-              "   - Fix OCR errors: 'PÂINE' → 'Pâine', 'UNTE' → 'Unt'\n"
-              "   - Keep Romanian names: 'Pâine' stays 'Pâine' (NOT 'Bread')\n"
-              "   - Use proper Romanian capitalization: 'PÂINE' → 'Pâine'\n"
-              "   - Fix Romanian diacritics: 'ă', 'â', 'î', 'ș', 'ț'\n"
-              "   - Common Romanian products: Pâine, Lapte, Unt, Brânză, Șuncă, Fructe, Legume\n\n"
-              "2. FIX PRICES (CRITICAL):\n"
-              "   - OCR often misreads prices (e.g., 1.89 might be 1.39, 3.09 might be 8.09)\n"
-              "   - Check if quantity × unit price = total price for each item\n"
-              "   - If not, adjust the unit price or quantity to make it consistent\n"
-              "   - All corrected prices must sum up to the receipt total (if provided)\n"
-              "   - Common OCR errors: 3→8, 5→6, 1→7, 0→8, 9→4\n\n"
-              "3. VALIDATION RULES:\n"
-              "   - Each line: quantity × price_single MUST equal price_total\n"
-              "   - Sum of all price_total MUST equal receipt total (if provided)\n"
-              "   - Prices must be realistic for Romanian supermarkets (0.50 - 250 RON per item)\n"
-              "   - KEEP PRODUCT NAMES IN ROMANIAN - DO NOT TRANSLATE TO ENGLISH\n\n"
-              "ROMANIAN PRODUCT EXAMPLES:\n"
-              "   - 'Pâine 500g' → 'Pâine 500 g' (NOT 'Bread 500 g')\n"
-              "   - 'Șuncă 200g' → 'Șuncă 200 g' (NOT 'Ham 200 g')\n"
-              "   - 'Lapte 1L' → 'Lapte 1 L'\n"
-              "   - 'Brânză 300g' → 'Brânză 300 g'\n\n"
-              "OUTPUT FORMAT (strict JSON):\n"
-            + "JSON schema not needed - using universal prompt"
-            + "\n\nIMPORTANT: Ensure all arithmetic is correct, total matches, and product names stay in Romanian!"
-        )
-    else:
-        # Универсальный промпт для других стран
-        prompt = f"""
-You are an expert in {country_code} retail geography and receipt data correction.
-
-CRITICAL TASK: Fix product names AND prices, AND determine the city from receipt data.
-
-RECEIPT DATA:
-- API_ID: {api_id}
-- Country: {country_code}
-- NIP (VAT Number): {nip or 'none'}
-- Store Network: {shopnetwork or 'none'}
-- Raw Address: {raw_address or 'none'}
-- Sample products from receipt:
-{products_text}
-
-RECEIPT ITEMS:
-{chr(10).join(lines)}{total_block}
-
-YOUR TASKS:
-1. FIX PRODUCT NAMES:
-   - Fix product names (brand first, title-case, ASCII where possible)
-   - Standardize units, expand common abbreviations
-   - Fix OCR errors and typos
-
-2. FIX PRICES (CRITICAL):
-   - OCR often misreads prices (e.g., 1.89 might be 1.39, 3.09 might be 8.09)
-   - Check if quantity × unit price = total price for each item
-   - If not, adjust the unit price or quantity to make it consistent
-   - All corrected prices must sum up to the receipt total (if provided)
-   - Common OCR errors: 3→8, 5→6, 1→7, 0→8, 9→4
-
-3. DETERMINE CITY (CRITICAL - USE NATIONAL NAMES):
-   - Use VAT/NIP first digits for regional hints if available
-   - Consider retail chain geographic presence knowledge
-   - Analyze product types for regional preferences
-   - Use general European geographic knowledge
-   - Consider population centers and economic hubs
-   - ALWAYS use national city names: Warszawa (not Warsaw), Roma (not Rome), München (not Munich)
-   - Check the country-specific city list below for correct national names
-
-EUROPEAN RETAIL CHAINS KNOWLEDGE:
-- ALDI: Strong in Germany, Netherlands, Belgium, France, Austria, Switzerland
-- LIDL: Pan-European presence, strong in Germany, France, Italy, Spain, Poland
-- CARREFOUR: Major cities in France, Spain, Italy, Belgium, Romania
-- TESCO: UK, Ireland, Czech Republic, Hungary, Slovakia, Poland
-- REWE: Germany, Austria, Czech Republic, Hungary
-- SPAR: Pan-European, especially Austria, Netherlands, Germany, Italy
-- EDEKA: Germany, strong regional presence
-- AUCHAN: France, Poland, Romania, Russia, Ukraine
-- INTERMARCHE: France, Belgium, Luxembourg, Portugal
-- PENNY: Germany, Austria, Italy, Czech Republic
-
-MAJOR EUROPEAN CITIES BY COUNTRY (USE NATIONAL NAMES):
-- POLAND: Warszawa, Kraków, Łódź, Wrocław, Poznań, Gdańsk, Szczecin, Bydgoszcz, Lublin, Katowice
-- GERMANY: Berlin, Hamburg, München, Köln, Frankfurt, Stuttgart, Düsseldorf, Dortmund, Essen, Leipzig
-- FRANCE: Paris, Marseille, Lyon, Toulouse, Nice, Nantes, Montpellier, Strasbourg, Bordeaux, Lille
-- ITALY: Roma, Milano, Napoli, Torino, Palermo, Genova, Bologna, Firenze, Bari, Catania
-- SPAIN: Madrid, Barcelona, Valencia, Sevilla, Zaragoza, Málaga, Murcia, Palma, Las Palmas, Bilbao
-- NETHERLANDS: Amsterdam, Rotterdam, Den Haag, Utrecht, Eindhoven, Tilburg, Groningen, Almere, Breda, Nijmegen
-- BELGIUM: Brussels, Antwerp, Ghent, Charleroi, Liège, Bruges, Namur, Leuven, Mons, Aalst
-- AUSTRIA: Vienna, Graz, Linz, Salzburg, Innsbruck, Klagenfurt, Villach, Wels, Sankt Pölten, Dornbirn
-- SWITZERLAND: Zürich, Geneva, Basel, Bern, Lausanne, Winterthur, Lucerne, St. Gallen, Lugano, Biel
-- ROMANIA: București, Cluj-Napoca, Timișoara, Iași, Constanța, Craiova, Galați, Ploiești, Brașov, Brăila
-- PORTUGAL: Lisboa, Porto, Braga, Setúbal, Coimbra, Queluz, Funchal, Cacém, Vila Nova de Gaia, Loures
-- HUNGARY: Budapest, Debrecen, Szeged, Miskolc, Pécs, Győr, Nyíregyháza, Kecskemét, Székesfehérvár, Szombathely
-- UNITED KINGDOM: London, Birmingham, Manchester, Glasgow, Liverpool, Leeds, Sheffield, Edinburgh, Bristol, Leicester
-
-OUTPUT FORMAT (strict JSON):
-{{
-  "api_id": "{api_id}",
-  "total_receipt": {total_receipt_str},
-  "total_calculated": <sum of all corrected price_total>,
-  "corrections_made": true/false,
-  "products": [
-    {{
-      "name_original": "original name from receipt",
-      "name_corrected": "fixed name",
-      "quantity": integer,
-      "price_single_original": number,
-      "price_single_corrected": number,
-      "price_total": number,
-      "price_correction_reason": "OCR error: 3→8" or null
+      "price_correction_reason": "OCR error: X→Y" or null
     }}
   ],
   "city_analysis": {{
     "city": "city name or UNKNOWN",
     "region": "region/province name or UNKNOWN",
-    "city_population": "population number if known",
-    "confidence": "HIGH/MEDIUM/LOW",
-    "evidence": "brief explanation of how you identified the location"
+    "zip_code": "extracted ZIP code or null",
+    "city_population": integer or null,
+    "match_method": "zip_code_match" | "address_parse" | "nip_hint" | "network_hint" | "unknown",
+    "confidence": "HIGH" | "MEDIUM" | "LOW",
+    "evidence": "brief explanation of how you determined the city"
   }}
 }}
 
-IMPORTANT: Ensure all arithmetic is correct, total matches, and provide best city estimate!
-
-CRITICAL: Return ONLY valid JSON, no markdown formatting, no code blocks, no explanations. Just pure JSON.
+**CRITICAL:**
+- Return ONLY valid JSON
+- NO markdown formatting, NO code blocks, NO explanations
+- Keep product names in NATIVE language
+- Extract city from address/ZIP if possible
 """
     return prompt
 
